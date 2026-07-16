@@ -153,7 +153,8 @@ def _gcode_stats(path: Path) -> dict:
         "layer_count": r"; total layer number:\s*(\d+)",
         "max_z_height": r"; max_z_height:\s*([\d.]+)",
         "nozzle_temp": r"; nozzle_temperature = (.+)",
-        "bed_temp": r"; (?:hot_plate|textured_plate|cool_plate|eng_plate)_temp = (.+)",
+        "bed_temp": r"M190 S([\d.]+)",
+        "bed_type": r";curr_bed_type:(.+)",
         "filament_type": r"; filament_type = (.+)",
         "printer": r"; printer_settings_id = (.+)",
         "print_profile": r"; print_settings_id = (.+)",
@@ -177,6 +178,7 @@ def slice_model(
     rotate_z: float | None = None,
     arrange: bool = True,
     orient: bool = False,
+    bed_type: str = "Textured PEI Plate",
 ) -> dict:
     """Slice an STL/3MF/STEP file to G-code headlessly using named OrcaSlicer
     presets (see list_profiles). Returns G-code path(s) plus print time and
@@ -197,6 +199,11 @@ def slice_model(
         machine_sys = _system_ancestor(printer, machine_idx)
         m_json = _write_cli_config(printer, "machine", workdir)
         p_json = _write_cli_config(process, "process", workdir, machine_sys)
+        # CLI defaults to Cool Plate (45C bed!) unless told otherwise — that
+        # cost us a nozzle once. Bake the real plate into the process config.
+        pd = json.loads(p_json.read_text())
+        pd["curr_bed_type"] = bed_type
+        p_json.write_text(json.dumps(pd))
         f_json = _write_cli_config(filament, "filament", workdir, machine_sys)
 
         cmd = [ORCA_BIN,
