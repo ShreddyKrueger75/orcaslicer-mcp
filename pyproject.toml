@@ -1,6 +1,6 @@
 [project]
 name = "orcaslicer-mcp"
-version = "0.3.0"
+version = "0.3.1"
 description = "MCP server for OrcaSlicer: headless slicing, profile management, G-code analysis, and printer control (Klipper/Moonraker, OctoPrint, PrusaLink, Duet, Elegoo, Bambu)"
 requires-python = ">=3.10"
 dependencies = [
@@ -11,3 +11,10 @@ dependencies = [
 
 [project.optional-dependencies]
 bambu = ["bambulabs-api>=2.6"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["server", "backends"]

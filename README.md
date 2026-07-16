@@ -51,7 +51,10 @@ tells the assistant to ask you which printer you own rather than guessing.
 Honest scope: only the Elegoo path has been exercised on real hardware by this
 project. The rest were built against each protocol's official docs and source
 (and fact-checked against them), with mock-transport tests asserting the parts
-that can bite — above all that **upload never starts a print**. Reports from
+that can bite — including that **upload never starts a print** (asserted for
+Moonraker, OctoPrint and PrusaLink, whose APIs have an auto-start flag to
+suppress; Duet, Elegoo and Bambu have no such flag — starting is a separate
+call by construction). Reports from
 real machines are welcome.
 
 Adding a protocol is one small class in `backends.py`.
@@ -96,7 +99,14 @@ paths are guarded:
   while busy; the tool refuses to fire unless the printer is idle, then polls
   until the job demonstrably starts (or reports the error code if it doesn't).
 - **Upload never prints.** Every backend suppresses its protocol's
-  start-on-upload flag, and the test suite asserts it per protocol.
+  start-on-upload flag, with tests per protocol that has one.
+- **Filenames are data, never syntax.** A name reaches firmware inside a G-code
+  argument (Duet: `M32 "name"`) and inside URLs; `;` or `"` would let a crafted
+  name append arbitrary G-code (`M109 S300`) or escape the upload directory.
+  Names are validated before they leave the server.
+- **No guessing which printer.** If several printers are configured and nothing
+  says which you mean, the server asks instead of picking; an unknown `host=`
+  is refused rather than driven with another printer's protocol and credentials.
 - **Bed type is whitelisted** against OrcaSlicer's own `BedType` enum (all 7
   plates, Supertack included). An unrecognized name would silently become Cool
   Plate; `slice_model` rejects invalid values instead.
@@ -134,6 +144,12 @@ OrcaSlicer 2.4.1 source (`src/OrcaSlicer.cpp`, ~line 2560).
   HTTP 500 — manage storage on the touchscreen.
 - OctoPrint and PrusaLink don't report layer counts over their APIs; Duet has
   no standard camera endpoint. Tools say so instead of failing obscurely.
+- The plate-clear gate relies on the printer reporting a finished job. Duet
+  (`job.lastFileName`) and OctoPrint (100% progress) are inferred; a *cancelled*
+  OctoPrint job is indistinguishable from idle over its API, so that one case
+  won't trip the gate.
+- On Windows the saved config can't be locked to your user with `chmod`; it
+  inherits the folder's ACL. Prefer `PRINTER_*` env vars if that matters.
 - Cloud host types (PrusaConnect, CrealityPrint, Obico, SimplyPrint,
   3DPrinterOS) aren't supported — point the server at the printer's own IP.
 - Editing profiles while the OrcaSlicer GUI is open may be overwritten when

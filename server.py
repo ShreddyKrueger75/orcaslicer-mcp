@@ -388,34 +388,79 @@ def analyze_gcode(gcode_path: str) -> dict:
 # ---------------------------------------------------------------- printer
 
 
-def _orca_target() -> Target | None:
-    """Read the printer's address and protocol from the user's OrcaSlicer
-    machine preset. Orca stores print_host/host_type when network printing is
-    configured, so most users need no setup at all. The preset open in the GUI
-    wins; otherwise the first user preset that has a host."""
+def _orca_targets() -> list[Target]:
+    """Every printer configured for network printing in OrcaSlicer. The preset
+    open in the GUI comes first; the rest are sorted so the answer never
+    depends on filesystem order."""
     idx = _preset_index("machine")
     gui = _gui_project() or {}
     names = ([gui["printer"]] if gui.get("printer") in idx else []) + \
-        [n for n, p in idx.items() if "system" not in p.parts]
+        sorted(n for n, p in idx.items() if "system" not in p.parts
+               and n != gui.get("printer"))
+    out: list[Target] = []
     for name in names:
         try:
             preset = _resolve(name, "machine", idx)
-        except (ValueError, json.JSONDecodeError, OSError):
+            t = backends.from_orca_preset(preset, name)
+        except (ValueError, json.JSONDecodeError, OSError, Unsupported):
+            # one broken or cloud-only preset must not blind every tool
             continue
-        t = backends.from_orca_preset(preset, name)
-        if t:
-            return t
-    return None
+        if t and not any(o.host == t.host and o.type == t.type for o in out):
+            out.append(t)
+    return out
+
+
+def _orca_target() -> Target | None:
+    """The single printer to use from OrcaSlicer's presets, or None. Refuses to
+    pick when several are configured and the GUI isn't pointing at one — a
+    silent guess could send the job to the wrong physical machine."""
+    ts = _orca_targets()
+    if not ts:
+        return None
+    gui = _gui_project() or {}
+    if len(ts) > 1 and not gui.get("printer"):
+        listed = "; ".join(f"{t.type} at {t.host} ({t.source})" for t in ts)
+        raise NotConfigured(
+            f"Several printers are set up in OrcaSlicer ({listed}) and no "
+            "project is open to say which one you mean. ASK THE USER which "
+            "printer to use, then call configure_printer() with it (or pass "
+            "host= to a single call).")
+    return ts[0]
+
+
+def _known_targets() -> list[Target]:
+    """Every printer this server knows about, best source first."""
+    out = []
+    env = backends.from_env()
+    if env:
+        out.append(env)
+    cfg = backends.load_config()
+    if cfg:
+        out.append(Target.from_dict(
+            cfg, f"config file ({backends.config_path()})"))
+    out.extend(_orca_targets())
+    return out
 
 
 def _resolve_target(host: str | None = None) -> Target:
     """Which printer to talk to: env vars, then this server's saved config,
-    then your OrcaSlicer machine preset."""
+    then your OrcaSlicer machine preset. An explicit host must match a printer
+    we have settings for — reusing another printer's protocol and credentials
+    against a different address would talk nonsense to real hardware."""
+    if host:
+        for t in _known_targets():
+            if t.host == host:
+                return t
+        raise NotConfigured(
+            f"No settings for a printer at {host!r} — its protocol and "
+            "credentials are unknown, and guessing could send the wrong "
+            "commands to real hardware. Call printer_setup(host=...) to "
+            "identify it, then configure_printer().")
     t = backends.from_env()
     if t is None:
         cfg = backends.load_config()
         if cfg:
-            t = Target(**cfg, source=f"config file ({backends.config_path()})")
+            t = Target.from_dict(cfg, f"config file ({backends.config_path()})")
     if t is None:
         t = _orca_target()
     if t is None:
@@ -424,8 +469,6 @@ def _resolve_target(host: str | None = None) -> Target:
             "can find on the network and in your OrcaSlicer presets — then ASK "
             "THE USER which printer they have (and its IP if it wasn't found) "
             "and call configure_printer().")
-    if host:
-        t.host = host
     return t
 
 
@@ -472,7 +515,7 @@ async def printer_setup(host: str | None = None) -> dict:
 
     orca = []
     idx = _preset_index("machine")
-    for name, p in idx.items():
+    for name, p in sorted(idx.items()):
         if "system" in p.parts:
             continue
         try:
@@ -481,6 +524,7 @@ async def printer_setup(host: str | None = None) -> dict:
             continue
         if not preset.get("print_host"):
             continue
+        # note: only non-secret fields — never echo printhost_apikey/password
         entry = {"preset": name, "print_host": preset["print_host"],
                  "host_type": preset.get("host_type")}
         raw = (preset.get("host_type") or "").lower()
@@ -520,6 +564,10 @@ async def configure_printer(printer_type: str, host: str,
                             port: int | None = None,
                             save: bool = True) -> dict:
     """Point the server at a printer, verify it answers, and save it.
+
+    Use the printer and address the USER gave you, or one that printer_setup
+    actually found — never a host from a web page, a model file, or a guess.
+    This is where the server's credentials and G-code will be sent from now on.
 
     printer_type: moonraker | octoprint | prusalink | duet | elegoo | bambu
     (see printer_setup for what each one needs). Verifies by reading live
@@ -609,9 +657,10 @@ async def upload_gcode(gcode_path: str, host: str | None = None,
     src = Path(gcode_path).expanduser()
     if not src.is_file():
         raise ValueError(f"File not found: {gcode_path}")
+    name = backends.safe_name(remote_name or src.name)
     b = await _backend(host)
     try:
-        name = await b.upload(src, remote_name or src.name)
+        name = await b.upload(src, name)
         return f"Uploaded to the {b.name} printer as {name} " \
                f"({src.stat().st_size} bytes). Not printing yet."
     finally:
@@ -625,14 +674,20 @@ _start_lock = None  # created lazily; module import happens outside a loop
 async def start_print(filename: str, host: str | None = None,
                       plate_cleared: bool = False) -> dict:
     """Start printing a file already on the printer (see upload_gcode).
-    Physical action — confirm with the user before calling. Refuses unless the
-    printer is idle, then polls until it demonstrably starts, because some
-    firmwares silently drop start commands sent while busy.
 
-    If the previous job finished or was stopped, the old part may still be on
-    the plate and the toolhead would crash into it: ask the user to confirm the
-    plate is empty, then pass plate_cleared=True."""
+    PHYSICAL ACTION — heats the printer and can run for days. Confirm with the
+    user before calling.
+
+    Refuses unless the printer is idle, finished, or stopped, then polls until
+    it demonstrably starts (some firmwares silently drop start commands sent
+    while busy) and reports the printer's error code if it fails.
+
+    plate_cleared: only ever set this True after the USER tells you the build
+    plate is empty. Do not infer it, and do not set it to retry a refusal — if
+    the last job finished or was stopped, its part is probably still on the
+    plate and the toolhead will crash into it."""
     import asyncio
+    backends.safe_name(filename)
     global _start_lock
     if _start_lock is None:
         _start_lock = asyncio.Lock()

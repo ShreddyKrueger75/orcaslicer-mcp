@@ -1,7 +1,7 @@
 # STATUS — OrcaSlicer MCP
 
 ## Current state (2026-07-16)
-- v0.3.0: device-agnostic printer control (moonraker/octoprint/prusalink/duet/elegoo/bambu) via `backends.py`; zero-config from OrcaSlicer machine presets; `printer_setup`/`configure_printer` flow. 14 self-tests green (`python test_server.py`).
+- v0.3.1: device-agnostic printer control, hardened by an adversarial pass (gcode injection, wrong-printer selection, plate gate on Duet/OctoPrint, Duet sessions) (moonraker/octoprint/prusalink/duet/elegoo/bambu) via `backends.py`; zero-config from OrcaSlicer machine presets; `printer_setup`/`configure_printer` flow. 28 self-tests green (`python test_server.py`).
 - Public: https://github.com/ShreddyKrueger75/orcaslicer-mcp
 - Live-verified on the CC1 through the new backend layer (status/discovery mid-print).
 

@@ -23,8 +23,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import socket
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -76,6 +76,31 @@ ORCA_HOST_TYPE_UNSUPPORTED = {
 }
 
 
+#: Filenames reach printer firmware as G-code arguments (Duet: M32 "name") and
+#: as URL paths. A `;` or `"` in a name is a command separator on RRF — a name
+#: like 'a.gcode"; M109 S300 ; "' would set the nozzle to 300C. Names are data,
+#: never syntax: allow what real slicer output contains and nothing else.
+_UNSAFE = re.compile(r'[;"\'`\\|&$<>\r\n\t\x00-\x1f]')
+
+
+def safe_name(name: str) -> str:
+    """Validate a printer-side filename. Raises ValueError on anything that
+    could break out of a G-code argument or escape the upload directory."""
+    if not name or not name.strip():
+        raise ValueError("Filename is empty.")
+    if len(name) > 255:
+        raise ValueError("Filename is too long (max 255).")
+    if _UNSAFE.search(name):
+        raise ValueError(
+            f"Refusing filename {name!r}: it contains characters that a "
+            "printer would read as G-code syntax, not as a name.")
+    if name.startswith("/") or ".." in name.split("/"):
+        raise ValueError(
+            f"Refusing filename {name!r}: absolute paths and '..' could write "
+            "outside the printer's upload directory.")
+    return name
+
+
 class Unsupported(RuntimeError):
     """The connected printer can't do this (firmware/protocol limit)."""
 
@@ -96,6 +121,21 @@ class Target:
     serial: str | None = None
     access_code: str | None = None
     source: str = "explicit"  # where these settings came from, for transparency
+
+    @classmethod
+    def from_dict(cls, d: dict, source: str) -> "Target":
+        """Build from saved JSON, tolerating a hand-edited or stale file."""
+        if not isinstance(d, dict) or not d.get("type") or not d.get("host"):
+            raise NotConfigured(
+                f"The saved printer config ({config_path()}) is missing "
+                "'type' or 'host'. Delete it or run configure_printer again.")
+        known = {f for f in cls.__dataclass_fields__ if f != "source"}
+        unknown = set(d) - known
+        if unknown:
+            raise NotConfigured(
+                f"The saved printer config ({config_path()}) has unknown "
+                f"keys {sorted(unknown)}. Delete it or run configure_printer.")
+        return cls(**d, source=source)
 
     def redacted(self) -> dict:
         d = {k: v for k, v in self.__dict__.items() if v is not None}
@@ -243,15 +283,22 @@ class MoonrakerBackend(_HttpBackend):
 
     async def status(self) -> dict:
         q = ("print_stats&extruder&heater_bed&virtual_sdcard&display_status")
-        d = (await self._json("GET", f"/printer/objects/query?{q}"))["result"]["status"]
-        ps = d.get("print_stats", {})
+        r = await self._json("GET", f"/printer/objects/query?{q}")
+        d = (r.get("result") or {}).get("status")
+        if not d:
+            # Klippy disconnected / config error: say so instead of KeyError
+            raise RuntimeError(
+                "Moonraker returned no printer status — Klippy is probably "
+                "disconnected or in an error state. Check Klipper's logs.")
+        ps = d.get("print_stats") or {}
         info = ps.get("info") or {}
-        ex, bed = d.get("extruder", {}), d.get("heater_bed", {})
+        ex, bed = d.get("extruder") or {}, d.get("heater_bed") or {}
         native = ps.get("state")
         state = self._STATE.get(native, BUSY)
-        # Klipper says "printing" while it's still heating the first layer
-        if state == PRINTING and ex.get("target") and \
-                ex.get("temperature", 0) < ex["target"] - 5:
+        # Klipper says "printing" while it's still heating the first layer.
+        # Fields can be null mid-restart, so compare only when both are real.
+        temp, target = ex.get("temperature"), ex.get("target")
+        if state == PRINTING and target and temp is not None and temp < target - 5:
             state = HEATING
         prog = d.get("virtual_sdcard", {}).get("progress")
         return _status(
@@ -342,7 +389,14 @@ class OctoPrintBackend(_HttpBackend):
         return {"X-Api-Key": self.t.api_key} if self.t.api_key else {}
 
     async def status(self) -> dict:
-        p = await self._json("GET", "/api/printer", params={"history": "false"})
+        try:
+            p = await self._json("GET", "/api/printer", params={"history": "false"})
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 409:  # OctoPrint: printer not connected
+                return _status(ERROR, native="disconnected",
+                               error="OctoPrint is not connected to the "
+                                     "printer (409). Connect it in OctoPrint.")
+            raise
         try:
             j = await self._json("GET", "/api/job")
         except httpx.HTTPError:
@@ -361,14 +415,20 @@ class OctoPrintBackend(_HttpBackend):
             state = IDLE
         else:
             state = BUSY
-        t = p.get("temperature", {})
-        tool, bed = t.get("tool0", {}), t.get("bed", {})
+        completion = (j.get("progress") or {}).get("completion")
+        if state == IDLE and completion is not None and completion >= 100:
+            # A finished job leaves the part on the plate; the start_print
+            # plate-clear gate keys off COMPLETE. (A *cancelled* job can't be
+            # told apart from idle via this API — see README known limits.)
+            state = COMPLETE
+        t = p.get("temperature") or {}
+        tool, bed = t.get("tool0") or {}, t.get("bed") or {}
         return _status(
             state, native=native,
             nozzle=tool.get("actual"), nozzle_target=tool.get("target"),
             bed=bed.get("actual"), bed_target=bed.get("target"),
-            filename=(j.get("job") or {}).get("file", {}).get("name"),
-            progress=(j.get("progress") or {}).get("completion"),
+            filename=((j.get("job") or {}).get("file") or {}).get("name"),
+            progress=completion,
             extra={"time": {"elapsed_s": (j.get("progress") or {}).get("printTime"),
                             "remaining_s": (j.get("progress") or {}).get("printTimeLeft")}})
 
@@ -508,7 +568,7 @@ class PrusaLinkBackend(_HttpBackend):
 
     async def files(self) -> list[str]:
         d = await self._json("GET", "/api/v1/files/usb")
-        return [f.get("name") for f in d.get("children", [])]
+        return [f.get("name") for f in (d.get("children") or [])]
 
     async def snapshot(self) -> bytes:
         r = await self.http.get("/api/v1/cameras/snap")  # PNG, not JPEG
@@ -555,17 +615,38 @@ class DuetBackend(_HttpBackend):
     def capabilities(self):
         return {"files", "layers", "attributes"}  # no standard camera
 
+    def __init__(self, target: Target):
+        super().__init__(target)
+        self._session = False
+
     async def _connect(self) -> None:
+        # RepRapFirmware allows only a handful of concurrent sessions and never
+        # reclaims ours until rr_disconnect. Connect once per backend instance;
+        # close() releases it. (Reconnecting per call exhausted the pool.)
+        if self._session:
+            return
         r = await self.http.get("/rr_connect",
                                 params={"password": self.t.password or "reprap"})
         r.raise_for_status()
         d = r.json()
-        if d.get("err"):  # 0 = success; 1 = bad password; 2 = no sessions
+        if d.get("err"):  # 0 = success; 1 = bad password; 2 = no free sessions
             raise RuntimeError(
                 f"Duet rejected the connection (err={d['err']}: "
-                f"{'wrong password' if d['err'] == 1 else 'no free sessions'}).")
+                + ("wrong password" if d["err"] == 1 else
+                   "no free sessions — close a Duet Web Control tab and retry")
+                + ").")
         if d.get("sessionKey") is not None:
             self.http.headers["X-Session-Key"] = str(d["sessionKey"])
+        self._session = True
+
+    async def close(self) -> None:
+        if self._session and self._client is not None:
+            try:
+                await self.http.get("/rr_disconnect")
+            except Exception:
+                pass  # best effort; the session times out on its own
+            self._session = False
+        await super().close()
 
     async def _model(self, key: str) -> dict:
         d = await self._json("GET", "/rr_model", params={"key": key, "flags": "d99"})
@@ -575,16 +656,24 @@ class DuetBackend(_HttpBackend):
         await self._connect()
         state, heat, job = (await self._model("state"),
                             await self._model("heat"), await self._model("job"))
-        heaters = heat.get("heaters", [])
+        heaters = heat.get("heaters") or []
         bed_i = (heat.get("bedHeaters") or [0])[0]
         tool_i = 1 if len(heaters) > 1 else 0
+        # bedHeaters is [-1] when no bed exists; a negative index would silently
+        # report the LAST heater (the hotend) as the bed temperature.
         bed_h = heaters[bed_i] if 0 <= bed_i < len(heaters) else {}
         tool_h = heaters[tool_i] if tool_i < len(heaters) else {}
         native = state.get("status")
+        mapped = self._STATE.get(native, BUSY)
         fobj = job.get("file") or {}
         size, pos = fobj.get("size"), job.get("filePosition")
+        # RRF reports plain "idle" after a finished print, which would slip past
+        # the plate-clear gate. job.lastFileName is set only once a file has
+        # finished and nothing is printing — that means a part is on the plate.
+        if mapped == IDLE and job.get("lastFileName"):
+            mapped = STOPPED if job.get("lastFileAborted") else COMPLETE
         return _status(
-            self._STATE.get(native, BUSY), native=native,
+            mapped, native=native,
             nozzle=tool_h.get("current"), nozzle_target=tool_h.get("active"),
             bed=bed_h.get("current"), bed_target=bed_h.get("active"),
             filename=fobj.get("fileName"),
@@ -592,6 +681,7 @@ class DuetBackend(_HttpBackend):
             progress=(pos / size * 100) if size and pos is not None else None)
 
     async def upload(self, path: Path, remote_name: str) -> str:
+        safe_name(remote_name)
         await self._connect()
         # Body is the raw file (not multipart) per the RRF wiki.
         r = await self.http.post("/rr_upload",
@@ -608,6 +698,10 @@ class DuetBackend(_HttpBackend):
         await self._json("GET", "/rr_gcode", params={"gcode": gcode})
 
     async def start(self, filename: str) -> None:
+        # The filename lands inside a G-code argument: RRF treats an unescaped
+        # `;` or `"` as a command separator, so a crafted name could append
+        # arbitrary G-code (e.g. M109 S300). safe_name() rejects that syntax.
+        safe_name(filename)
         await self._gcode(f'M32 "/gcodes/{filename}"')
 
     async def pause(self):
@@ -695,6 +789,12 @@ class ElegooBackend(Backend):
         return {S.IDLE: IDLE, S.PRINTING: PRINTING, S.PAUSED: PAUSED,
                 S.COMPLETED: COMPLETE, S.STOPPED: STOPPED, S.ERROR: ERROR,
                 S.PREHEATING: HEATING, S.PREHEATING_COMPLETED: HEATING,
+                # the CC1's long pre-print routine: all "busy", all active
+                S.HOMING: BUSY, S.AUTO_LEVELING: BUSY, S.PRINT_START: BUSY,
+                S.RESONANCE_TESTING: BUSY, S.FILE_CHECKING: BUSY,
+                S.PRINTER_CHECKING: BUSY, S.AUTO_LEVELING_COMPLETED: BUSY,
+                S.HOMING_COMPLETED: BUSY, S.RESONANCE_TESTING_COMPLETED: BUSY,
+                S.PAUSING: BUSY, S.STOPPING: BUSY, S.RESUMING: BUSY,
                 }.get(code, BUSY)
 
     @staticmethod
@@ -723,6 +823,7 @@ class ElegooBackend(Backend):
                             if pi.total_ticks else None}})
 
     async def upload(self, path: Path, remote_name: str) -> str:
+        safe_name(remote_name)
         p = await self._conn(control=True)
         try:
             return await p.upload_file(str(path), remote_name=remote_name)
@@ -829,7 +930,10 @@ class BambuBackend(Backend):
     async def status(self) -> dict:
         p = await self._conn()
         g = lambda fn, *a: asyncio.to_thread(fn, *a)
-        native = str(await g(p.get_current_state))
+        raw = await g(p.get_current_state)
+        # older bambulabs-api stringifies as "GcodeState.RUNNING", newer as
+        # "RUNNING"; .name is stable across both.
+        native = getattr(raw, "name", None) or str(raw).rsplit(".", 1)[-1]
         return _status(
             self._STATE.get(native.upper(), BUSY), native=native,
             nozzle=await g(p.get_nozzle_temperature),
@@ -842,14 +946,16 @@ class BambuBackend(Backend):
             error=await g(p.print_error_code))
 
     async def upload(self, path: Path, remote_name: str) -> str:
+        safe_name(remote_name)
         p = await self._conn()
         with path.open("rb") as fh:
             await asyncio.to_thread(p.upload_file, fh, remote_name)
         return remote_name
 
-    async def start(self, filename: str) -> None:
+    async def start(self, filename: str, plate: int = 1) -> None:
+        safe_name(filename)
         p = await self._conn()
-        ok = await asyncio.to_thread(p.start_print, filename, 1)
+        ok = await asyncio.to_thread(p.start_print, filename, plate)
         if ok is False:
             raise RuntimeError("Printer rejected the start command.")
 
@@ -954,7 +1060,9 @@ def save_config(target: Target) -> Path:
     d = {k: v for k, v in target.__dict__.items()
          if v is not None and k != "source"}
     p.write_text(json.dumps(d, indent=2))
-    p.chmod(0o600)  # it holds API keys / access codes
+    if os.name != "nt":
+        p.chmod(0o600)  # it holds API keys / access codes
+    # On Windows chmod can't express this; the file inherits the parent ACL.
     return p
 
 

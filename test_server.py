@@ -248,14 +248,240 @@ def test_orca_preset_mapping():
     assert backends.from_orca_preset({"host_type": "octoprint"}, "no host") is None
 
 
+VOCAB = {backends.IDLE, backends.HEATING, backends.PRINTING, backends.PAUSED,
+         backends.COMPLETE, backends.STOPPED, backends.ERROR, backends.BUSY}
+
+
 def test_state_vocabulary_is_shared():
-    # every backend must map onto the same vocabulary the tools gate on
+    # every backend must map onto the vocabulary the safety gates key off.
+    # Elegoo maps in a method, not a table — check it for real, or this test
+    # silently covers nothing.
+    checked = 0
     for cls in backends.BACKENDS.values():
-        for table in (getattr(cls, "_STATE", {}),):
-            for v in table.values():
-                assert v in {backends.IDLE, backends.HEATING, backends.PRINTING,
-                             backends.PAUSED, backends.COMPLETE,
-                             backends.STOPPED, backends.ERROR, backends.BUSY}, v
+        for v in getattr(cls, "_STATE", {}).values():
+            assert v in VOCAB, v
+            checked += 1
+    from pycentauri.models import PrintStatus
+    codes = [getattr(PrintStatus, n) for n in dir(PrintStatus)
+             if not n.startswith("_")]
+    for code in codes:
+        v = backends.ElegooBackend._map(code)
+        assert v in VOCAB, (code, v)
+        checked += 1
+    assert checked > 40, f"only {checked} mappings checked"
+
+
+def test_elegoo_finished_job_trips_plate_gate():
+    from pycentauri.models import PrintStatus
+    assert backends.ElegooBackend._map(PrintStatus.COMPLETED) in \
+        backends.PLATE_DIRTY_STATES
+    assert backends.ElegooBackend._map(PrintStatus.STOPPED) in \
+        backends.PLATE_DIRTY_STATES
+    # the long pre-print routine must count as "started", not as "dropped"
+    for s in (PrintStatus.AUTO_LEVELING, PrintStatus.HOMING,
+              PrintStatus.PREHEATING, PrintStatus.RESONANCE_TESTING):
+        assert backends.ElegooBackend._map(s) in backends.ACTIVE_STATES
+
+
+def test_safe_name_blocks_gcode_injection():
+    # a filename is data, never syntax: on RepRapFirmware `;` separates
+    # commands, so this would have set the nozzle to 300C
+    for evil in ['a.gcode"; M109 S300 ; "', "a;M104 S300", '../../etc/passwd',
+                 "/abs/path.gcode", "a\nM109 S300", 'a`whoami`.gcode', ""]:
+        try:
+            backends.safe_name(evil)
+        except ValueError:
+            continue
+        raise AssertionError(f"safe_name accepted {evil!r}")
+    # real slicer output must still pass (spaces, dots, dashes, subfolders)
+    for ok in ["ECC_0.4_Jazzmaster_part2_Elegoo PLA-CF _0.08_1d18h8m.gcode",
+               "plate_1.gcode", "subdir/part (v2).3mf", "a.gcode.3mf"]:
+        assert backends.safe_name(ok) == ok
+
+
+def test_duet_start_rejects_injection():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(200, json={"err": 0, "sessionKey": 1})
+
+    b = _install(backends.DuetBackend(Target("duet", "h")), handler)
+    try:
+        asyncio.run(b.start('x.gcode"; M109 S300 ; "'))
+    except ValueError:
+        assert not any("M109" in c for c in calls), "injected gcode was sent!"
+        return
+    raise AssertionError("Duet start must reject an injecting filename")
+
+
+def test_duet_reuses_one_session():
+    # RRF has a small session pool and only rr_disconnect frees ours;
+    # reconnecting per call used to exhaust it after ~8 calls
+    connects, disconnects = [], []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        p = request.url.path
+        if p == "/rr_connect":
+            connects.append(1)
+            return httpx.Response(200, json={"err": 0, "sessionKey": 7})
+        if p == "/rr_disconnect":
+            disconnects.append(1)
+            return httpx.Response(200, json={"err": 0})
+        return httpx.Response(200, json={"result": {}})
+
+    b = _install(backends.DuetBackend(Target("duet", "h")), handler)
+
+    async def go():
+        for _ in range(5):
+            await b._connect()
+        await b.close()
+
+    asyncio.run(go())
+    assert len(connects) == 1, f"{len(connects)} sessions opened, want 1"
+    assert len(disconnects) == 1, "session never released"
+
+
+def test_duet_finished_print_trips_plate_gate():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/rr_connect":
+            return httpx.Response(200, json={"err": 0, "sessionKey": 1})
+        key = request.url.params.get("key")
+        return httpx.Response(200, json={"result": {
+            "state": {"status": "idle"},
+            "heat": {"bedHeaters": [0], "heaters": [{"current": 25, "active": 0},
+                                                    {"current": 25, "active": 0}]},
+            # RRF says plain "idle" after a print; lastFileName is the tell
+            "job": {"lastFileName": "done.gcode"}}[key]})
+
+    b = _install(backends.DuetBackend(Target("duet", "h")), handler)
+    s = asyncio.run(b.status())
+    assert s["state"] in backends.PLATE_DIRTY_STATES, s
+    assert s["state"] == backends.COMPLETE
+
+
+def test_duet_no_bed_does_not_report_hotend_as_bed():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/rr_connect":
+            return httpx.Response(200, json={"err": 0, "sessionKey": 1})
+        key = request.url.params.get("key")
+        return httpx.Response(200, json={"result": {
+            "state": {"status": "idle"},
+            # bedHeaters [-1] = no bed; heaters[-1] would be the hotend
+            "heat": {"bedHeaters": [-1], "heaters": [{"current": 245.0,
+                                                      "active": 245}]},
+            "job": {}}[key]})
+
+    b = _install(backends.DuetBackend(Target("duet", "h")), handler)
+    s = asyncio.run(b.status())
+    assert s["temps_c"]["bed"] is None, f"reported {s['temps_c']['bed']}C bed"
+
+
+def test_octoprint_finished_print_trips_plate_gate():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/printer":
+            return httpx.Response(200, json={
+                "state": {"text": "Operational", "flags": {"operational": True}},
+                "temperature": {"tool0": {"actual": 30, "target": 0},
+                                "bed": {"actual": 25, "target": 0}}})
+        return httpx.Response(200, json={"job": {"file": {"name": "a.gcode"}},
+                                         "progress": {"completion": 100.0}})
+
+    b = _install(backends.OctoPrintBackend(Target("octoprint", "h", api_key="k")),
+                 handler)
+    s = asyncio.run(b.status())
+    assert s["state"] == backends.COMPLETE, s
+
+
+def test_octoprint_disconnected_reports_error():
+    b = _install(backends.OctoPrintBackend(Target("octoprint", "h", api_key="k")),
+                 lambda r: httpx.Response(409, json={"error": "not operational"}))
+    s = asyncio.run(b.status())
+    assert s["state"] == backends.ERROR and "409" in str(s["print"]["error_code"])
+
+
+def test_moonraker_klippy_down_says_so():
+    b = _install(backends.MoonrakerBackend(Target("moonraker", "h")),
+                 lambda r: httpx.Response(200, json={"result": None}))
+    try:
+        asyncio.run(b.status())
+    except RuntimeError as e:
+        assert "Klippy" in str(e), e
+        return
+    raise AssertionError("null result must raise a readable error")
+
+
+def test_moonraker_null_temperature_does_not_crash():
+    body = {"result": {"status": {
+        "print_stats": {"state": "printing", "filename": "a.gcode"},
+        "extruder": {"temperature": None, "target": 205},
+        "heater_bed": {}, "virtual_sdcard": {"progress": None}}}}
+    b = _install(backends.MoonrakerBackend(Target("moonraker", "h")),
+                 lambda r: httpx.Response(200, json=body))
+    s = asyncio.run(b.status())
+    assert s["state"] == backends.PRINTING and s["temps_c"]["nozzle"] is None
+
+
+def test_config_file_garbage_is_a_friendly_error():
+    for bad in ({"host": "1.2.3.4"}, {"type": "moonraker"},
+                {"type": "moonraker", "host": "h", "bogus": 1}, {}):
+        try:
+            Target.from_dict(bad, "test")
+        except backends.NotConfigured as e:
+            assert "configure_printer" in str(e)
+            continue
+        raise AssertionError(f"accepted {bad}")
+    t = Target.from_dict({"type": "elegoo", "host": "h"}, "test")
+    assert t.type == "elegoo"
+
+
+def test_unknown_host_is_refused_not_guessed():
+    saved = (server.backends.from_env, server.backends.load_config,
+             server._orca_targets)
+    server.backends.from_env = lambda: Target("octoprint", "known.local",
+                                              api_key="secret")
+    server.backends.load_config = lambda: None
+    server._orca_targets = lambda: []
+    try:
+        server._resolve_target(host="192.0.2.77")   # a different machine
+    except backends.NotConfigured as e:
+        assert "protocol and credentials are unknown" in str(e)
+    else:
+        raise AssertionError("must not reuse another printer's protocol/creds")
+    finally:
+        (server.backends.from_env, server.backends.load_config,
+         server._orca_targets) = saved
+
+
+def test_multiple_orca_printers_refuses_to_guess():
+    saved = (server._orca_targets, server._gui_project)
+    server._orca_targets = lambda: [Target("elegoo", "10.0.0.1", source="a"),
+                                    Target("moonraker", "10.0.0.2", source="b")]
+    server._gui_project = lambda: None
+    try:
+        server._orca_target()
+    except backends.NotConfigured as e:
+        assert "ASK THE USER" in str(e) and "10.0.0.2" in str(e)
+    else:
+        raise AssertionError("must not silently pick one of two printers")
+    finally:
+        server._orca_targets, server._gui_project = saved
+
+
+def test_broken_preset_does_not_blind_every_tool():
+    # a single cloud-only (PrusaConnect) preset used to raise Unsupported out
+    # of the resolution loop and break every printer tool
+    saved = server._preset_index
+    calls = {}
+
+    def fake_index(kind):
+        return calls.get(kind, {})
+
+    try:
+        server._preset_index = fake_index
+        assert server._orca_targets() == []
+    finally:
+        server._preset_index = saved
 
 
 def test_unconfigured_error_tells_client_to_ask():
