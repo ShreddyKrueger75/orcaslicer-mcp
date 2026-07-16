@@ -37,6 +37,10 @@ ORCA_DATA = Path(os.environ.get("ORCA_SLICER_DATA") or {
     "Windows": Path(os.environ.get("APPDATA", "")) / "OrcaSlicer",
 }.get(_SYSTEM, Path.home() / ".config/OrcaSlicer"))
 DEFAULT_BED_TYPE = os.environ.get("DEFAULT_BED_TYPE", "Textured PEI Plate")
+# Orca silently falls back to Cool Plate (45C) on an unrecognized bed type —
+# that failure mode already cost a hotend, so reject bad values loudly.
+VALID_BED_TYPES = ("Cool Plate", "Engineering Plate", "High Temp Plate",
+                   "Textured PEI Plate")
 KINDS = ("machine", "process", "filament")
 
 mcp = FastMCP("orcaslicer")
@@ -135,6 +139,11 @@ def update_profile(name: str, kind: str, settings: dict) -> str:
     path = idx[name]
     if "system" in path.parts:
         raise ValueError(f"{name!r} is a system preset; edit a user copy instead.")
+    if "post_process" in settings:
+        # post_process runs shell commands at slice time — a preset edit must
+        # never become code execution. Set it in the OrcaSlicer GUI if needed.
+        raise ValueError("Refusing to set 'post_process' (executes shell "
+                         "commands when slicing).")
     d = json.loads(path.read_text())
     d.update(settings)
     path.write_text(json.dumps(d, indent=4))
@@ -150,23 +159,32 @@ def _gui_project() -> dict | None:
     conf = ORCA_DATA / "OrcaSlicer.conf"
     if not conf.is_file():
         return None
-    backup = json.loads(conf.read_text()).get("app", {}).get("last_backup_path")
+    try:
+        backup = json.loads(conf.read_text()).get("app", {}).get("last_backup_path")
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        return None
     if not backup:
         return None
     cfg = None
     for cand in ["Metadata/project_settings.config", "_temp_1.config"]:
         p = Path(backup) / cand
         if p.is_file():
-            cfg = json.loads(p.read_text())
-            break
+            try:
+                cfg = json.loads(p.read_text())
+                break
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                continue  # GUI may be mid-write; treat as no project
     if cfg is None:
         return None
     origin = Path(backup) / "origin.txt"
+    filaments = cfg.get("filament_settings_id")
+    if isinstance(filaments, str):  # single-filament projects store a string
+        filaments = [filaments]
     return {
         "origin_file": origin.read_text().strip() if origin.is_file() else None,
         "printer": cfg.get("printer_settings_id"),
         "process": cfg.get("print_settings_id"),
-        "filaments": cfg.get("filament_settings_id"),
+        "filaments": filaments,
         "bed_type": cfg.get("curr_bed_type"),
         "layer_height": cfg.get("layer_height"),
         "wall_loops": cfg.get("wall_loops"),
@@ -288,6 +306,10 @@ def slice_model(
     process = process or gui.get("process")
     filament = filament or (gui.get("filaments") or [None])[0]
     bed_type = bed_type or gui.get("bed_type") or DEFAULT_BED_TYPE
+    if bed_type not in VALID_BED_TYPES:
+        raise ValueError(f"Unknown bed_type {bed_type!r} — Orca would silently "
+                         f"fall back to Cool Plate (45C bed). "
+                         f"Valid: {VALID_BED_TYPES}")
     missing = [n for n, v in [("printer", printer), ("process", process),
                               ("filament", filament)] if not v]
     if missing:
@@ -434,18 +456,14 @@ async def printer_status(host: str | None = None) -> dict:
 
 
 @mcp.tool()
-async def printer_snapshot(host: str | None = None,
-                           save_path: str | None = None) -> Image:
+async def printer_snapshot(host: str | None = None) -> Image:
     """Grab a webcam snapshot from the printer's camera — use it to check
-    first-layer adhesion and mid-print health remotely. Optionally also saves
-    the JPEG to save_path."""
+    first-layer adhesion and mid-print health remotely."""
     p = await _printer(host)
     try:
         jpeg = await p.snapshot()
     finally:
         await p.close()
-    if save_path:
-        Path(save_path).expanduser().write_bytes(jpeg)
     return Image(data=jpeg, format="jpeg")
 
 
@@ -469,6 +487,8 @@ async def printer_files(host: str | None = None) -> dict:
     p = await _printer(host)
     try:
         return await p.list_files()
+    except Exception as e:
+        return {"supported": False, "error": str(e)}
     finally:
         await p.close()
 
@@ -498,61 +518,90 @@ async def upload_gcode(gcode_path: str, host: str | None = None,
         await p.close()
 
 
+_start_lock = None  # created lazily; module import happens outside a loop
+
+
 @mcp.tool()
 async def start_print(filename: str, host: str | None = None,
-                      auto_leveling: bool = True) -> dict:
+                      auto_leveling: bool = True,
+                      plate_cleared: bool = False) -> dict:
     """Start printing a file already on the printer (see upload_gcode).
     Physical action — confirm with the user before calling. Verifies the
     printer was idle, issues the command, then polls until the printer
     actually enters its pre-print/printing sequence (the firmware silently
-    drops start commands sent while it is busy)."""
+    drops start commands sent while it is busy).
+
+    If the previous job COMPLETED or was STOPPED, the old part may still be
+    on the plate and the toolhead would crash into it: you must ask the user
+    to confirm the plate is empty, then pass plate_cleared=True."""
+    import asyncio
     from pycentauri.models import PrintStatus
+    global _start_lock
+    if _start_lock is None:
+        _start_lock = asyncio.Lock()
     ACTIVE = {PrintStatus.HOMING, PrintStatus.PREHEATING, PrintStatus.AUTO_LEVELING,
               PrintStatus.RESONANCE_TESTING, PrintStatus.PRINT_START,
               PrintStatus.PRINTING, PrintStatus.FILE_CHECKING,
               PrintStatus.PRINTER_CHECKING, PrintStatus.AUTO_LEVELING_COMPLETED,
               PrintStatus.PREHEATING_COMPLETED, PrintStatus.HOMING_COMPLETED,
               PrintStatus.RESONANCE_TESTING_COMPLETED}
-    p = await _printer(host, control=True)
-    try:
-        before = (await p.status()).print_info.status
-        if before not in (PrintStatus.IDLE, PrintStatus.COMPLETED, PrintStatus.STOPPED):
-            raise RuntimeError(
-                f"Printer is not idle (state: {_state_name(before)}) — the "
-                "firmware silently drops start commands while busy. Wait for "
-                "idle, then retry.")
-        await p.start_print(filename, auto_leveling=auto_leveling)
-        deadline = time.monotonic() + 30
-        last = before
-        import asyncio
-        while time.monotonic() < deadline:
-            await asyncio.sleep(3)
-            st = await p.status()
-            last = st.print_info.status
-            if last == PrintStatus.ERROR:
+    if _start_lock.locked():
+        raise RuntimeError("Another start_print is already in progress.")
+    async with _start_lock:
+        p = await _printer(host, control=True)
+        try:
+            before = (await p.status()).print_info.status
+            if before in (PrintStatus.COMPLETED, PrintStatus.STOPPED) and not plate_cleared:
                 raise RuntimeError(
-                    f"Printer entered ERROR after start (error_code="
-                    f"{st.print_info.err_num}).")
-            if last in ACTIVE:
-                return {"started": True, "filename": filename,
-                        "state": _state_name(last),
-                        "note": "Pre-print routine (clean/level/calibrate) "
-                                "takes ~10-15 min before extrusion begins."}
-        raise RuntimeError(
-            f"start_print was issued but the printer never left "
-            f"{_state_name(last)} within 30s — the command was likely "
-            "dropped. Check the printer and retry.")
-    finally:
-        await p.close()
+                    f"Previous job state is {_state_name(before)} — the old "
+                    "part may still be on the plate and the toolhead would "
+                    "crash into it. Confirm with the user that the plate is "
+                    "empty, then call again with plate_cleared=True.")
+            if before not in (PrintStatus.IDLE, PrintStatus.COMPLETED, PrintStatus.STOPPED):
+                raise RuntimeError(
+                    f"Printer is not idle (state: {_state_name(before)}) — the "
+                    "firmware silently drops start commands while busy. Wait for "
+                    "idle, then retry.")
+            await p.start_print(filename, auto_leveling=auto_leveling)
+            deadline = time.monotonic() + 30
+            last = before
+            while time.monotonic() < deadline:
+                await asyncio.sleep(3)
+                st = await p.status()
+                last = st.print_info.status
+                if last == PrintStatus.ERROR:
+                    raise RuntimeError(
+                        f"Printer entered ERROR after start (error_code="
+                        f"{st.print_info.err_num}).")
+                if last in ACTIVE:
+                    return {"started": True, "filename": filename,
+                            "state": _state_name(last),
+                            "note": "Pre-print routine (clean/level/calibrate) "
+                                    "takes ~10-15 min before extrusion begins."}
+            raise RuntimeError(
+                f"start_print was issued but the printer never left "
+                f"{_state_name(last)} within 30s — the command was likely "
+                "dropped. Check the printer and retry.")
+        finally:
+            await p.close()
 
 
 @mcp.tool()
 async def print_control(action: str, host: str | None = None) -> str:
-    """Pause, resume, or stop the current print. action: pause|resume|stop."""
+    """Pause, resume, or stop the current print. action: pause|resume|stop.
+    resume only works from a PAUSED state — resuming a stopped/errored job
+    would drive the nozzle into whatever went wrong."""
+    from pycentauri.models import PrintStatus
     if action not in ("pause", "resume", "stop"):
         raise ValueError("action must be pause, resume, or stop")
     p = await _printer(host, control=True)
     try:
+        if action == "resume":
+            state = (await p.status()).print_info.status
+            if state not in (PrintStatus.PAUSED, PrintStatus.PAUSING):
+                raise RuntimeError(
+                    f"Refusing to resume from {_state_name(state)} — resume "
+                    "is only safe from a paused print.")
         await getattr(p, action)()
         return f"OK: {action}"
     finally:

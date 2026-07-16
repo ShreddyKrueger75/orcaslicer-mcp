@@ -60,10 +60,24 @@ paths are guarded:
 - **`start_print` verifies.** The CC firmware silently drops start commands
   while busy; the tool refuses to fire unless the printer is idle, then polls
   until the job demonstrably starts (or reports the error code if it doesn't).
+- **Bed type is whitelisted.** An unrecognized plate name would silently
+  become Cool Plate; `slice_model` rejects invalid values instead.
+- **Plate-clear gate.** Starting a new job while the previous one is
+  COMPLETED/STOPPED (old part likely still on the plate) requires an explicit
+  `plate_cleared=True` after the user confirms — otherwise the toolhead can
+  crash into the finished part. Concurrent `start_print` calls are locked out.
+- **`resume` only resumes paused prints** — never a stopped/errored job where
+  the nozzle may be sitting in a failure.
+- **Preset edits can't become code.** `update_profile` refuses the
+  `post_process` key (it executes shell commands at slice time).
 - **Your GUI choices win.** If a project is open in OrcaSlicer, unset slicing
   parameters come from it rather than from the model's guesses.
 - `start_print`'s description instructs clients to confirm with the user —
   it heats hardware.
+
+Scope note: this is a local, single-user tool. File-path parameters
+(`model_path`, `output_dir`, `gcode_path`) operate on your filesystem with
+your permissions, like any local CLI.
 
 ## How headless slicing works (the non-obvious part)
 
