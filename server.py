@@ -2,19 +2,25 @@
 
 Tools: preset listing/reading/editing, headless slicing via the OrcaSlicer CLI
 (with full preset-inheritance resolution), G-code analysis, reading the GUI's
-open-project state, and Elegoo Centauri Carbon printer control via pycentauri
-(status, webcam snapshot, upload, start/pause/resume/stop).
+open-project state, and network printer control (status, webcam snapshot,
+upload, start/pause/resume/stop) for any supported printer — see backends.py.
 
 Configuration (env vars, all optional):
   ORCA_SLICER_BIN   path to the OrcaSlicer executable
   ORCA_SLICER_DATA  path to OrcaSlicer's config dir (system/user presets)
-  PRINTER_HOST      printer IP; default: print_host from your machine preset
-  DEFAULT_BED_TYPE  plate used when neither caller nor GUI project says:
-                    "Cool Plate" | "Engineering Plate" | "High Temp Plate" |
-                    "Textured PEI Plate"
+  DEFAULT_BED_TYPE  plate used when neither the caller nor the GUI project says
+  PRINTER_TYPE      moonraker | octoprint | prusalink | duet | elegoo | bambu
+  PRINTER_HOST      printer IP/hostname
+  PRINTER_PORT / PRINTER_API_KEY / PRINTER_USER / PRINTER_PASSWORD /
+  PRINTER_SERIAL / PRINTER_ACCESS_CODE / PRINTER_SNAPSHOT_URL
+                    per-protocol connection details (see printer_setup)
+  ORCASLICER_MCP_CONFIG  path to the saved printer config JSON
+
+With no printer env vars set, the server reads the printer's address and
+protocol straight from your OrcaSlicer machine preset (print_host/host_type),
+then falls back to its own saved config. printer_setup() reports what it found.
 """
 
-import base64
 import json
 import os
 import platform
@@ -26,6 +32,9 @@ import time
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP, Image
+
+import backends
+from backends import NotConfigured, Target, Unsupported
 
 _SYSTEM = platform.system()
 ORCA_BIN = os.environ.get("ORCA_SLICER_BIN") or {
@@ -39,7 +48,9 @@ ORCA_DATA = Path(os.environ.get("ORCA_SLICER_DATA") or {
 DEFAULT_BED_TYPE = os.environ.get("DEFAULT_BED_TYPE", "Textured PEI Plate")
 # Orca silently falls back to Cool Plate (45C) on an unrecognized bed type —
 # that failure mode already cost a hotend, so reject bad values loudly.
-VALID_BED_TYPES = ("Cool Plate", "Engineering Plate", "High Temp Plate",
+# Verbatim from OrcaSlicer's BedType key map (src/libslic3r/PrintConfig.cpp).
+VALID_BED_TYPES = ("Default Plate", "Cool Plate", "Textured Cool Plate",
+                   "Supertack Plate", "Engineering Plate", "High Temp Plate",
                    "Textured PEI Plate")
 KINDS = ("machine", "process", "filament")
 
@@ -377,120 +388,217 @@ def analyze_gcode(gcode_path: str) -> dict:
 # ---------------------------------------------------------------- printer
 
 
-def _default_host() -> str | None:
-    """PRINTER_HOST env var, else first print_host in user machine presets."""
-    if os.environ.get("PRINTER_HOST"):
-        return os.environ["PRINTER_HOST"]
-    for _, path in _preset_index("machine").items():
-        if "system" in path.parts:
+def _orca_target() -> Target | None:
+    """Read the printer's address and protocol from the user's OrcaSlicer
+    machine preset. Orca stores print_host/host_type when network printing is
+    configured, so most users need no setup at all. The preset open in the GUI
+    wins; otherwise the first user preset that has a host."""
+    idx = _preset_index("machine")
+    gui = _gui_project() or {}
+    names = ([gui["printer"]] if gui.get("printer") in idx else []) + \
+        [n for n, p in idx.items() if "system" not in p.parts]
+    for name in names:
+        try:
+            preset = _resolve(name, "machine", idx)
+        except (ValueError, json.JSONDecodeError, OSError):
             continue
-        host = json.loads(path.read_text()).get("print_host")
-        if host:
-            return host
+        t = backends.from_orca_preset(preset, name)
+        if t:
+            return t
     return None
 
 
-async def _printer(host: str | None, control: bool = False):
-    from pycentauri import connect_auto, discover
-    h = host or _default_host()
-    if not h:
-        raise ValueError("No printer host given, no PRINTER_HOST env var, and "
-                         "no print_host found in machine presets.")
-    mainboard_id = None
+def _resolve_target(host: str | None = None) -> Target:
+    """Which printer to talk to: env vars, then this server's saved config,
+    then your OrcaSlicer machine preset."""
+    t = backends.from_env()
+    if t is None:
+        cfg = backends.load_config()
+        if cfg:
+            t = Target(**cfg, source=f"config file ({backends.config_path()})")
+    if t is None:
+        t = _orca_target()
+    if t is None:
+        raise NotConfigured(
+            "No printer configured. Call printer_setup() — it reports what it "
+            "can find on the network and in your OrcaSlicer presets — then ASK "
+            "THE USER which printer they have (and its IP if it wasn't found) "
+            "and call configure_printer().")
+    if host:
+        t.host = host
+    return t
+
+
+async def _backend(host: str | None = None) -> backends.Backend:
+    return backends.make(_resolve_target(host))
+
+
+@mcp.tool()
+async def printer_setup(host: str | None = None) -> dict:
+    """Find out which printer we can talk to, and what's still needed.
+
+    Call this first when printer tools report no configuration, or when the
+    user changes hardware. It reports the current config, any printer found in
+    your OrcaSlicer presets, and anything answering on the network (Elegoo
+    printers self-announce; pass host= to probe a specific IP).
+
+    If nothing usable is found, ASK THE USER which printer they own and its IP
+    address, then call configure_printer(). Never guess the printer type — the
+    wrong protocol can mean wrong temperatures on real hardware."""
+    out: dict = {"supported_types": {
+        "moonraker": "Klipper machines (Voron, RatRig, Sovol, Creality K1, "
+                     "Elegoo Neptune 4...). Needs: host, optional api_key.",
+        "octoprint": "Any printer behind OctoPrint. Needs: host, api_key "
+                     "(OctoPrint > Settings > API).",
+        "prusalink": "Prusa MK4/MK3.9/XL/MINI/CORE One. Needs: host, password "
+                     "(printer screen: Settings > Network > PrusaLink), "
+                     "user defaults to 'maker'.",
+        "duet": "Duet 2/3 (RepRapFirmware). Needs: host, password if set.",
+        "elegoo": "Elegoo Centauri Carbon. Needs: host only.",
+        "bambu": "Bambu Lab P1/X1/A1/H2 in LAN mode (experimental). Needs: "
+                 "host, serial, access_code (printer: Settings > Network > "
+                 "LAN Only Mode) and the [bambu] extra installed.",
+    }}
     try:
-        found = await discover(timeout=3.0)
-        for d in found:
-            if getattr(d, "host", None) == h:
-                mainboard_id = getattr(d, "mainboard_id", None)
-                break
-    except Exception:
-        pass  # discovery is best-effort; connect_auto works without it mid-print
-    return await connect_auto(h, enable_control=control, mainboard_id=mainboard_id)
+        t = _resolve_target(host)
+        out["configured"] = t.redacted()
+        out["configured_from"] = t.source
+    except NotConfigured as e:
+        out["configured"] = None
+        out["note"] = str(e)
+    except Unsupported as e:
+        out["configured"] = None
+        out["note"] = str(e)
+
+    orca = []
+    idx = _preset_index("machine")
+    for name, p in idx.items():
+        if "system" in p.parts:
+            continue
+        try:
+            preset = _resolve(name, "machine", idx)
+        except Exception:
+            continue
+        if not preset.get("print_host"):
+            continue
+        entry = {"preset": name, "print_host": preset["print_host"],
+                 "host_type": preset.get("host_type")}
+        raw = (preset.get("host_type") or "").lower()
+        if raw in backends.ORCA_HOST_TYPE:
+            entry["type"] = backends.ORCA_HOST_TYPE[raw]
+        elif raw in backends.ORCA_HOST_TYPE_UNSUPPORTED:
+            entry["unsupported"] = backends.ORCA_HOST_TYPE_UNSUPPORTED[raw]
+        orca.append(entry)
+    out["orcaslicer_presets"] = orca
+
+    found = await backends.elegoo_broadcast()
+    seen = {f["host"] for f in found}
+    candidates = ([host] if host else []) + [e["print_host"] for e in orca]
+    for h in candidates:
+        if h in seen:
+            continue
+        hit = await backends.probe_host(h)
+        if hit:
+            found.append(hit)
+            seen.add(h)
+    out["found_on_network"] = found
+    out["next_step"] = (
+        "Ready — printer tools will work." if out.get("configured") else
+        "Ask the user which printer they have (and its IP if not listed in "
+        "found_on_network), then call configure_printer(). If found_on_network "
+        "lists a type, confirm it with the user rather than assuming.")
+    return out
 
 
-def _state_name(code: int) -> str:
-    from pycentauri.models import PrintStatus
-    for name in dir(PrintStatus):
-        if not name.startswith("_") and getattr(PrintStatus, name) == code:
-            return name.lower()
-    return f"unknown({code})"
+@mcp.tool()
+async def configure_printer(printer_type: str, host: str,
+                            api_key: str | None = None,
+                            user: str | None = None,
+                            password: str | None = None,
+                            serial: str | None = None,
+                            access_code: str | None = None,
+                            port: int | None = None,
+                            save: bool = True) -> dict:
+    """Point the server at a printer, verify it answers, and save it.
 
-
-def _status_dict(s) -> dict:
-    pi = s.print_info
-    return {
-        "state": _state_name(pi.status),
-        "state_code": pi.status,
-        "print": {
-            "filename": pi.filename,
-            "current_layer": pi.current_layer,
-            "total_layers": pi.total_layer,
-            "progress_pct": pi.progress,
-            "elapsed_s": pi.current_ticks,
-            "total_s": pi.total_ticks,
-            "error_code": pi.err_num,
-            "speed_pct": pi.print_speed,
-            "task_id": pi.task_id,
-        },
-        "temps_c": {
-            "nozzle": round(s.temp_nozzle, 1), "nozzle_target": s.temp_nozzle_target,
-            "bed": round(s.temp_bed, 1), "bed_target": s.temp_bed_target,
-            "chamber": round(s.temp_chamber, 1), "chamber_target": s.temp_chamber_target,
-        },
-        "fans_pct": dict(s.fan_speed) if s.fan_speed else {},
-        "position": list(s.coord) if s.coord else None,
-        "z_offset": s.z_offset,
-    }
+    printer_type: moonraker | octoprint | prusalink | duet | elegoo | bambu
+    (see printer_setup for what each one needs). Verifies by reading live
+    status before saving — a config that can't connect is never written.
+    The file is written user-only (0600) since it holds keys/access codes."""
+    if printer_type not in backends.TYPES:
+        raise ValueError(f"printer_type must be one of {backends.TYPES}")
+    t = Target(type=printer_type, host=host, port=port, api_key=api_key,
+               user=user, password=password, serial=serial,
+               access_code=access_code, source="configure_printer")
+    b = backends.make(t)
+    try:
+        status = await b.status()
+        try:
+            attrs = await b.attributes()
+        except Exception:
+            attrs = {}
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not talk to a {printer_type} printer at {host}: {e}. "
+            "Nothing was saved. Check the address, the credentials, and that "
+            "printer_setup's found_on_network agrees with this type.") from e
+    finally:
+        await b.close()
+    out = {"ok": True, "printer": t.redacted(), "attributes": attrs,
+           "status": status}
+    if save:
+        out["saved_to"] = str(backends.save_config(t))
+    return out
 
 
 @mcp.tool()
 async def printer_status(host: str | None = None) -> dict:
-    """Live printer status: decoded state (idle/printing/auto_leveling/...),
-    temps, layer progress, error code. host defaults to PRINTER_HOST or the
-    print_host in your OrcaSlicer machine preset."""
-    p = await _printer(host)
+    """Live printer status: normalized state (idle/heating/printing/paused/
+    complete/stopped/error/busy), temps, layer progress. Works with any
+    supported printer; `native_state` keeps the firmware's own wording."""
+    b = await _backend(host)
     try:
-        return _status_dict(await p.status())
+        s = await b.status()
+        return {"backend": b.name, **s}
     finally:
-        await p.close()
+        await b.close()
 
 
 @mcp.tool()
 async def printer_snapshot(host: str | None = None) -> Image:
-    """Grab a webcam snapshot from the printer's camera — use it to check
-    first-layer adhesion and mid-print health remotely."""
-    p = await _printer(host)
+    """Grab a still from the printer's camera — use it to check first-layer
+    adhesion and mid-print health remotely. Not every printer has one."""
+    b = await _backend(host)
     try:
-        jpeg = await p.snapshot()
+        img = await b.snapshot()
     finally:
-        await p.close()
-    return Image(data=jpeg, format="jpeg")
+        await b.close()
+    fmt = "png" if img[:4] == b"\x89PNG" else "jpeg"
+    return Image(data=img, format=fmt)
 
 
 @mcp.tool()
 async def printer_attributes(host: str | None = None) -> dict:
-    """Printer identity and firmware info (model, firmware version,
-    mainboard id) — useful when debugging protocol quirks."""
-    p = await _printer(host)
+    """Printer identity and firmware info — useful when debugging protocol
+    quirks or confirming the server is talking to the right machine."""
+    b = await _backend(host)
     try:
-        a = await p.attributes()
-        return {k: v for k, v in a.model_dump().items() if k != "raw"}
+        return await b.attributes()
     finally:
-        await p.close()
+        await b.close()
 
 
 @mcp.tool()
 async def printer_files(host: str | None = None) -> dict:
-    """List G-code files stored on the printer. NOTE: the CC1 firmware does not
-    support this over SDCP (works on CC2); on CC1 manage files on the
-    touchscreen."""
-    p = await _printer(host)
+    """List G-code files stored on the printer. Some firmwares don't allow it
+    (notably the Elegoo Centauri Carbon CC1)."""
+    b = await _backend(host)
     try:
-        return await p.list_files()
-    except Exception as e:
-        return {"supported": False, "error": str(e)}
+        return {"backend": b.name, "files": await b.files()}
+    except Unsupported as e:
+        return {"backend": b.name, "supported": False, "reason": str(e)}
     finally:
-        await p.close()
+        await b.close()
 
 
 @mcp.tool()
@@ -501,21 +609,13 @@ async def upload_gcode(gcode_path: str, host: str | None = None,
     src = Path(gcode_path).expanduser()
     if not src.is_file():
         raise ValueError(f"File not found: {gcode_path}")
-    p = await _printer(host, control=True)
+    b = await _backend(host)
     try:
-        name = await p.upload_file(str(src), remote_name=remote_name)
-        return f"Uploaded as {name} ({src.stat().st_size} bytes)"
-    except Exception as e:
-        if "500" in str(e):
-            raise RuntimeError(
-                f"Upload failed: {e}. On the CC1 this usually means the "
-                "printer is busy (printing/leveling/maintenance) or its "
-                "storage is full — the firmware can't report which. Wait for "
-                "idle and/or delete old files on the touchscreen, then retry."
-            ) from e
-        raise
+        name = await b.upload(src, remote_name or src.name)
+        return f"Uploaded to the {b.name} printer as {name} " \
+               f"({src.stat().st_size} bytes). Not printing yet."
     finally:
-        await p.close()
+        await b.close()
 
 
 _start_lock = None  # created lazily; module import happens outside a loop
@@ -523,89 +623,83 @@ _start_lock = None  # created lazily; module import happens outside a loop
 
 @mcp.tool()
 async def start_print(filename: str, host: str | None = None,
-                      auto_leveling: bool = True,
                       plate_cleared: bool = False) -> dict:
     """Start printing a file already on the printer (see upload_gcode).
-    Physical action — confirm with the user before calling. Verifies the
-    printer was idle, issues the command, then polls until the printer
-    actually enters its pre-print/printing sequence (the firmware silently
-    drops start commands sent while it is busy).
+    Physical action — confirm with the user before calling. Refuses unless the
+    printer is idle, then polls until it demonstrably starts, because some
+    firmwares silently drop start commands sent while busy.
 
-    If the previous job COMPLETED or was STOPPED, the old part may still be
-    on the plate and the toolhead would crash into it: you must ask the user
-    to confirm the plate is empty, then pass plate_cleared=True."""
+    If the previous job finished or was stopped, the old part may still be on
+    the plate and the toolhead would crash into it: ask the user to confirm the
+    plate is empty, then pass plate_cleared=True."""
     import asyncio
-    from pycentauri.models import PrintStatus
     global _start_lock
     if _start_lock is None:
         _start_lock = asyncio.Lock()
-    ACTIVE = {PrintStatus.HOMING, PrintStatus.PREHEATING, PrintStatus.AUTO_LEVELING,
-              PrintStatus.RESONANCE_TESTING, PrintStatus.PRINT_START,
-              PrintStatus.PRINTING, PrintStatus.FILE_CHECKING,
-              PrintStatus.PRINTER_CHECKING, PrintStatus.AUTO_LEVELING_COMPLETED,
-              PrintStatus.PREHEATING_COMPLETED, PrintStatus.HOMING_COMPLETED,
-              PrintStatus.RESONANCE_TESTING_COMPLETED}
     if _start_lock.locked():
         raise RuntimeError("Another start_print is already in progress.")
     async with _start_lock:
-        p = await _printer(host, control=True)
+        b = await _backend(host)
         try:
-            before = (await p.status()).print_info.status
-            if before in (PrintStatus.COMPLETED, PrintStatus.STOPPED) and not plate_cleared:
+            before = await b.status()
+            state = before["state"]
+            if state in backends.PLATE_DIRTY_STATES and not plate_cleared:
                 raise RuntimeError(
-                    f"Previous job state is {_state_name(before)} — the old "
-                    "part may still be on the plate and the toolhead would "
+                    f"The last job is {state} ({before['native_state']}) — the "
+                    "old part may still be on the plate and the toolhead would "
                     "crash into it. Confirm with the user that the plate is "
                     "empty, then call again with plate_cleared=True.")
-            if before not in (PrintStatus.IDLE, PrintStatus.COMPLETED, PrintStatus.STOPPED):
+            if state not in backends.STARTABLE_STATES:
                 raise RuntimeError(
-                    f"Printer is not idle (state: {_state_name(before)}) — the "
-                    "firmware silently drops start commands while busy. Wait for "
-                    "idle, then retry.")
-            await p.start_print(filename, auto_leveling=auto_leveling)
+                    f"Printer is not idle (state: {state} / "
+                    f"{before['native_state']}). Wait for it to finish.")
+            await b.start(filename)
             deadline = time.monotonic() + 30
-            last = before
+            last = state
             while time.monotonic() < deadline:
                 await asyncio.sleep(3)
-                st = await p.status()
-                last = st.print_info.status
-                if last == PrintStatus.ERROR:
+                now = await b.status()
+                last = now["state"]
+                if last == backends.ERROR:
                     raise RuntimeError(
-                        f"Printer entered ERROR after start (error_code="
-                        f"{st.print_info.err_num}).")
-                if last in ACTIVE:
+                        f"Printer entered ERROR after start "
+                        f"(error={now['print']['error_code']}).")
+                if last in backends.ACTIVE_STATES:
                     return {"started": True, "filename": filename,
-                            "state": _state_name(last),
-                            "note": "Pre-print routine (clean/level/calibrate) "
-                                    "takes ~10-15 min before extrusion begins."}
+                            "backend": b.name, "state": last,
+                            "native_state": now["native_state"],
+                            "note": "Some printers run a calibration routine "
+                                    "for several minutes before extruding."}
             raise RuntimeError(
-                f"start_print was issued but the printer never left "
-                f"{_state_name(last)} within 30s — the command was likely "
-                "dropped. Check the printer and retry.")
+                f"start_print was issued but the printer never left {last} "
+                "within 30s — the command was likely dropped. Check the "
+                "printer and retry.")
         finally:
-            await p.close()
+            await b.close()
 
 
 @mcp.tool()
-async def print_control(action: str, host: str | None = None) -> str:
+async def print_control(action: str, host: str | None = None) -> dict:
     """Pause, resume, or stop the current print. action: pause|resume|stop.
-    resume only works from a PAUSED state — resuming a stopped/errored job
-    would drive the nozzle into whatever went wrong."""
-    from pycentauri.models import PrintStatus
+    resume only acts on a paused print — never on a stopped or errored job,
+    where the nozzle may be sitting in a failure."""
     if action not in ("pause", "resume", "stop"):
         raise ValueError("action must be pause, resume, or stop")
-    p = await _printer(host, control=True)
+    b = await _backend(host)
     try:
-        if action == "resume":
-            state = (await p.status()).print_info.status
-            if state not in (PrintStatus.PAUSED, PrintStatus.PAUSING):
-                raise RuntimeError(
-                    f"Refusing to resume from {_state_name(state)} — resume "
-                    "is only safe from a paused print.")
-        await getattr(p, action)()
-        return f"OK: {action}"
+        state = (await b.status())["state"]
+        if action == "resume" and state != backends.PAUSED:
+            raise RuntimeError(
+                f"Printer is {state}, not paused — refusing to resume. Resuming "
+                "a stopped or failed job can drive the nozzle into a blob.")
+        if action == "pause" and state not in (backends.PRINTING,
+                                               backends.HEATING,
+                                               backends.BUSY):
+            raise RuntimeError(f"Printer is {state} — nothing to pause.")
+        await getattr(b, action)()
+        return {"ok": True, "action": action, "backend": b.name}
     finally:
-        await p.close()
+        await b.close()
 
 
 if __name__ == "__main__":
