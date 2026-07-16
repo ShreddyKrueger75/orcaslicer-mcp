@@ -296,7 +296,7 @@ async def upload_gcode(gcode_path: str, host: str | None = None,
     use start_print for that."""
     if not Path(gcode_path).expanduser().is_file():
         raise ValueError(f"File not found: {gcode_path}")
-    p = await _printer(host)
+    p = await _printer(host, control=True)
     try:
         name = await p.upload_file(str(Path(gcode_path).expanduser()),
                                    remote_name=remote_name)
