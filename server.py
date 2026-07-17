@@ -288,12 +288,26 @@ def _gcode_stats(path: Path) -> dict:
     return stats
 
 
+def _int_list(value: str, param: str) -> str:
+    """Validate a comma-separated list of positive 1-based ints (object and
+    filament indices) before it reaches the CLI. Rejects negatives/zero."""
+    parts = [p.strip() for p in value.split(",") if p.strip()]
+    if not parts or not all(p.isdigit() and int(p) >= 1 for p in parts):
+        raise ValueError(f"{param} must be comma-separated 1-based integers, "
+                         f"e.g. \"1,3,5\" — got {value!r}")
+    return ",".join(parts)
+
+
 @mcp.tool()
 def slice_model(
     model_path: str,
     printer: str | None = None,
     process: str | None = None,
     filament: str | None = None,
+    filaments: list[str] | None = None,
+    filament_ids: str | None = None,
+    plate: int | None = None,
+    skip_objects: str | None = None,
     output_dir: str | None = None,
     scale: float | None = None,
     rotate_z: float | None = None,
@@ -307,26 +321,48 @@ def slice_model(
     the user's on-screen choices win over guesses. Returns G-code path(s) plus
     numeric print time / filament estimates and the ACTUAL bed/nozzle temps
     from the G-code. orient=True lets Orca pick the orientation — leave off if
-    the model is already oriented correctly."""
+    the model is already oriented correctly.
+
+    Multi-material: pass `filaments` as a list of preset names (extruder/AMS
+    slot 1, 2, …); `filament_ids` maps objects to those slots, e.g. "1,2,1".
+    `plate` slices one plate (1-based) instead of all; `skip_objects` ("3,5")
+    omits objects from the print. `filament` (singular) is still accepted as
+    shorthand for a single-material print."""
     model = Path(model_path).expanduser()
     if not model.is_file():
         raise ValueError(f"Model not found: {model}")
 
     gui = _gui_project() or {}
+    if filament and not filaments:
+        filaments = [filament]
+    filaments = filaments or gui.get("filaments") or []
+    filaments = [f for f in filaments if f]
     printer = printer or gui.get("printer")
     process = process or gui.get("process")
-    filament = filament or (gui.get("filaments") or [None])[0]
     bed_type = bed_type or gui.get("bed_type") or DEFAULT_BED_TYPE
     if bed_type not in VALID_BED_TYPES:
         raise ValueError(f"Unknown bed_type {bed_type!r} — Orca would silently "
                          f"fall back to Cool Plate (45C bed). "
                          f"Valid: {VALID_BED_TYPES}")
     missing = [n for n, v in [("printer", printer), ("process", process),
-                              ("filament", filament)] if not v]
+                              ("filament", filaments)] if not v]
     if missing:
         raise ValueError(
             f"No {'/'.join(missing)} preset given and no open GUI project to "
             f"default from. Pass them explicitly (see list_profiles).")
+    if filament_ids:
+        filament_ids = _int_list(filament_ids, "filament_ids")
+        over = max(int(x) for x in filament_ids.split(","))
+        if over > len(filaments):
+            raise ValueError(
+                f"filament_ids references slot {over} but only "
+                f"{len(filaments)} filament(s) given. Pass that many entries "
+                "in `filaments`, or lower the ids.")
+    if skip_objects:
+        skip_objects = _int_list(skip_objects, "skip_objects")
+    if plate is not None and plate < 1:
+        raise ValueError("plate is 1-based; use plate=1 for the first plate, "
+                         "or leave it unset to slice all plates.")
 
     outdir = Path(output_dir).expanduser() if output_dir else model.parent / "sliced"
     outdir.mkdir(parents=True, exist_ok=True)
@@ -340,7 +376,10 @@ def slice_model(
         machine_sys = _system_ancestor(printer, machine_idx)
         m_json = _write_cli_config(printer, "machine", workdir)
         p_json = _write_cli_config(process, "process", workdir, machine_sys)
-        f_json = _write_cli_config(filament, "filament", workdir, machine_sys)
+        # one flat config per filament — reuses the same inheritance +
+        # compatible_printers pinning that makes a single filament slice
+        f_jsons = [_write_cli_config(f, "filament", workdir, machine_sys)
+                   for f in filaments]
         # The CLI silently defaults to Cool Plate (45C bed!) unless told
         # otherwise — that once cost a hotend. Bake the real plate in.
         pd = json.loads(p_json.read_text())
@@ -349,12 +388,16 @@ def slice_model(
 
         cmd = [ORCA_BIN,
                "--load-settings", f"{m_json};{p_json}",
-               "--load-filaments", str(f_json),
-               "--slice", "0",
+               "--load-filaments", ";".join(str(f) for f in f_jsons),
+               "--slice", str(plate) if plate is not None else "0",
                "--arrange", "1" if arrange else "0",
                "--orient", "1" if orient else "0",
                "--ensure-on-bed",
                "--outputdir", str(outdir)]
+        if filament_ids:
+            cmd += ["--load-filament-ids", filament_ids]
+        if skip_objects:
+            cmd += ["--skip-objects", skip_objects]
         if scale:
             cmd += ["--scale", str(scale)]
         if rotate_z:
@@ -368,7 +411,14 @@ def slice_model(
                 f"Slicing produced no G-code (exit {r.returncode}).\n"
                 f"stdout tail: {r.stdout[-2000:]}\nstderr tail: {r.stderr[-2000:]}")
         return {"presets_used": {"printer": printer, "process": process,
-                                 "filament": filament, "bed_type": bed_type},
+                                 "filaments": filaments,
+                                 # keep the singular key for single-material
+                                 # callers that predate multi-filament
+                                 "filament": filaments[0] if len(filaments) == 1
+                                 else None,
+                                 "bed_type": bed_type,
+                                 "filament_ids": filament_ids or "auto",
+                                 "plate": plate if plate is not None else "all"},
                 "gcode_files": [str(g) for g in gcodes],
                 "plates": [_gcode_stats(g) for g in gcodes]}
     finally:
@@ -753,6 +803,68 @@ async def print_control(action: str, host: str | None = None) -> dict:
             raise RuntimeError(f"Printer is {state} — nothing to pause.")
         await getattr(b, action)()
         return {"ok": True, "action": action, "backend": b.name}
+    finally:
+        await b.close()
+
+
+@mcp.tool()
+async def watch_print(until: str = "change", timeout_s: float = 60,
+                      host: str | None = None) -> dict:
+    """Watch a running print and return once something worth knowing happens —
+    so you can follow a long job without spamming printer_status.
+
+    until: what to wait for —
+      "change"   any state transition (default)
+      "printing" | "paused" | "complete" | "stopped" | "error" | "idle"
+      a specific normalized state to wait for.
+    timeout_s: how long to wait before returning anyway (clamped to 300s — a
+      single call can't watch a multi-hour print; call again to keep watching).
+
+    Returns the latest status plus `reason` (reached | changed | error |
+    timeout) and the progress moved during the wait. ERROR always returns
+    immediately, whatever `until` is."""
+    import asyncio
+    valid = {"change", backends.IDLE, backends.HEATING, backends.PRINTING,
+             backends.PAUSED, backends.COMPLETE, backends.STOPPED,
+             backends.ERROR, backends.BUSY}
+    if until not in valid:
+        raise ValueError(f"until must be one of {sorted(valid)}")
+    # ponytail: a bounded poll, not a stream — MCP tools return, they can't
+    # push. The client calls again to keep watching a long job.
+    timeout_s = max(3.0, min(float(timeout_s), 300.0))
+    b = await _backend(host)
+    try:
+        first = await b.status()
+        start_state = first["state"]
+        start_layer = first["print"].get("current_layer")
+        deadline = time.monotonic() + timeout_s
+        latest = first
+        while True:
+            state = latest["state"]
+            if state == backends.ERROR:
+                reason = "error"
+            elif until != "change" and state == until:
+                reason = "reached"
+            elif until == "change" and state != start_state:
+                reason = "changed"
+            elif time.monotonic() >= deadline:
+                reason = "timeout"
+            else:
+                await asyncio.sleep(3)
+                latest = await b.status()
+                continue
+            end_layer = latest["print"].get("current_layer")
+            return {"backend": b.name, "reason": reason,
+                    "state": latest["state"],
+                    "native_state": latest["native_state"],
+                    "progress_pct": latest["print"].get("progress_pct"),
+                    "layer": end_layer,
+                    "total_layers": latest["print"].get("total_layers"),
+                    "layers_advanced": (end_layer - start_layer)
+                    if isinstance(end_layer, int) and isinstance(start_layer, int)
+                    else None,
+                    "temps_c": latest["temps_c"],
+                    "filename": latest["print"].get("filename")}
     finally:
         await b.close()
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.0 — 2026-07-16
+- **Print monitoring:** new `watch_print` tool — a bounded poll (≤300s) that returns on a state change, a target state, or an error, with the progress moved during the wait. Follow a multi-day job without hand-writing status loops. Backend-agnostic; no backend changes.
+- **Slicing depth:** `slice_model` gains `filaments` (multi-material list), `filament_ids` (object→slot map, "1,2,1"), `plate` (slice one plate), and `skip_objects` ("3,5"). The singular `filament` parameter still works, and `presets_used` keeps a `filament` key for single-material prints alongside the new `filaments` list. `filament_ids` is bounds-checked against the number of filaments. Reuses the existing preset-inheritance resolver per filament. AMS slot mapping deferred.
+- **Backends proven end-to-end:** new `test_fixtures.py` runs a stdlib HTTP server on an ephemeral socket so the real httpx client is exercised against it — proving PrusaLink Digest auth, the Duet session/disconnect lifecycle, and real multipart uploads (which `MockTransport` can't reach). Upload-never-prints is now asserted over a real socket for every REST protocol.
+- **Polish:** GitHub Actions CI (Python 3.11/3.12) running the suite on every push/PR, a tests badge, `CONTRIBUTING.md` (how to add a backend + the safety rules), issue templates, and an honest example session in the README.
+- Tests: 28 → 40.
+
 ## 0.3.1 — 2026-07-16
 Adversarial review of the v0.3.0 backends (24 findings, all fixed):
 - **Security fix (Duet):** a filename was interpolated straight into `M32 "…"`, so a crafted name (`a.gcode"; M109 S300 ; "`) could append arbitrary G-code — e.g. drive the nozzle to 300 °C. Filenames are now validated everywhere they reach firmware or a URL path (also closes a PrusaLink upload path-traversal).

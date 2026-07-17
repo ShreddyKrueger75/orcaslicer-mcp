@@ -1,5 +1,7 @@
 # OrcaSlicer MCP
 
+![tests](https://github.com/ShreddyKrueger75/orcaslicer-mcp/actions/workflows/ci.yml/badge.svg)
+
 An MCP server that gives Claude (or any MCP client) the full FDM pipeline:
 **slice models headlessly with OrcaSlicer, manage presets, analyze G-code, and
 control your printer** over the local network — Klipper, OctoPrint, Prusa,
@@ -7,6 +9,22 @@ Duet, Elegoo, or Bambu.
 
 Ask your assistant to *"slice this STL with my draft profile and tell me the
 print time"* or *"check on the print and show me the camera"* — and it can.
+
+## Example session
+
+```
+You:  Slice ~/Downloads/bracket.stl for my printer and tell me the print time.
+🤖   Sliced with your open project's presets (PLA, 0.20mm, Textured PEI @65°C):
+     1h 42m, 24.3g, 210 layers → bracket.gcode
+You:  Looks good — print it.
+🤖   Uploaded bracket.gcode. The plate looks clear from the last job — confirm
+     it's empty and I'll start it.
+You:  It's clear.
+🤖   Started. It'll calibrate for a few minutes, then begin layer 1.
+You:  Keep an eye on it.
+🤖   [watch_print] Still printing — layer 6/210, nozzle 210°C, bed 65°C.
+     Advanced 5 layers in the last minute. Want a camera snapshot?
+```
 
 ## Tools
 
@@ -16,7 +34,7 @@ print time"* or *"check on the print and show me the camera"* — and it can.
 | `get_profile` | Read a preset with its full inheritance chain resolved |
 | `update_profile` | Edit a user preset (system presets are read-only) |
 | `gui_project_state` | Read what's open in the OrcaSlicer GUI — file + chosen presets/settings |
-| `slice_model` | STL/3MF/STEP → G-code via the OrcaSlicer CLI; presets default to the open GUI project; returns time/filament/temp stats |
+| `slice_model` | STL/3MF/STEP → G-code via the OrcaSlicer CLI; presets default to the open GUI project; multi-filament, plate selection, skip-objects; returns time/filament/temp stats |
 | `analyze_gcode` | Parse Orca G-code: time, filament, layers, and the **actual commanded temps** (M109/M190) |
 | `printer_setup` | What printer we can talk to and what's still needed — run this first |
 | `configure_printer` | Point the server at a printer, verify it answers, save it |
@@ -27,6 +45,7 @@ print time"* or *"check on the print and show me the camera"* — and it can.
 | `upload_gcode` | Upload G-code (does **not** start printing) |
 | `start_print` | Start a print — checks the printer is idle first, then **verifies the job actually started** |
 | `print_control` | Pause / resume / stop |
+| `watch_print` | Wait (bounded) for a state change / target state / error and report progress — follow a long job without polling by hand |
 
 ## Printer support
 
@@ -50,14 +69,19 @@ tells the assistant to ask you which printer you own rather than guessing.
 
 Honest scope: only the Elegoo path has been exercised on real hardware by this
 project. The rest were built against each protocol's official docs and source
-(and fact-checked against them), with mock-transport tests asserting the parts
-that can bite — including that **upload never starts a print** (asserted for
-Moonraker, OctoPrint and PrusaLink, whose APIs have an auto-start flag to
-suppress; Duet, Elegoo and Bambu have no such flag — starting is a separate
-call by construction). Reports from
-real machines are welcome.
+(and fact-checked against them), then tested two ways: mock-transport unit tests
+and **end-to-end tests that drive the real HTTP client over a real socket
+against a fixture server** — which prove what mocks can't, including PrusaLink's
+Digest auth handshake, the Duet session/disconnect lifecycle, and that **upload
+never starts a print** on every protocol. What's still unproven is each
+firmware's real-world quirks; reports from real machines are welcome.
 
-Adding a protocol is one small class in `backends.py`.
+Adding a protocol is one small class in `backends.py` — see
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
+Multi-material: `slice_model` takes a `filaments` list and a `filament_ids`
+object→slot map. AMS/CFS *slot* mapping (which physical Bambu/Klipper spool is
+which) isn't modelled yet — the list order is the extruder/slot order.
 
 ## Setup
 

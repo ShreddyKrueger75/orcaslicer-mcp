@@ -501,6 +501,267 @@ def test_unconfigured_error_tells_client_to_ask():
          server._orca_target) = saved
 
 
+# -------------------------------------------------- slicing depth (WS2)
+
+
+def test_int_list_validation():
+    assert server._int_list("1,3,5", "x") == "1,3,5"
+    assert server._int_list(" 1 , 2 ", "x") == "1,2"
+    # negatives/zero are not valid 1-based indices — must be rejected
+    for bad in ("a,b", "1,x", "", "1;2", "-1", "-1,3", "--5", "0", "1,0"):
+        try:
+            server._int_list(bad, "skip_objects")
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {bad!r}")
+
+
+def test_slice_filament_ids_bounds_checked():
+    # referencing more slots than filaments given must fail early, clearly
+    machines = server._preset_index("machine")
+    fils = server.list_profiles("filament")["filament"]
+    procs = server._preset_index("process")
+    if not (machines and len(fils) >= 1 and procs):
+        print("  (skipped: no OrcaSlicer presets)")
+        return
+    try:
+        _spy_slice_argv(model_path="test/cube.stl", printer=next(iter(machines)),
+                        process=next(iter(procs)), filaments=[fils[0]["name"]],
+                        filament_ids="1,2", bed_type="Textured PEI Plate")
+    except ValueError as e:
+        assert "slot 2" in str(e) and "1 filament" in str(e)
+        return
+    raise AssertionError("filament_ids beyond the filament count must raise")
+
+
+def _spy_slice_argv(**kwargs):
+    """Run slice_model but capture the CLI argv instead of really slicing."""
+    import subprocess
+    orig, seen = subprocess.run, {}
+
+    class _Done:
+        returncode = 0
+        stdout = stderr = ""
+
+    def spy(cmd, **kw):
+        seen["cmd"] = cmd
+        # write a fake plate so the no-gcode guard passes
+        out = cmd[cmd.index("--outputdir") + 1]
+        Path(out, "plate_1.gcode").write_text("M190 S65\nM109 S220\n"
+                                              "; total layer number: 1\n")
+        return _Done()
+
+    subprocess.run = spy
+    try:
+        with tempfile.TemporaryDirectory() as out:
+            server.slice_model(output_dir=out, **kwargs)
+        return seen["cmd"]
+    finally:
+        subprocess.run = orig
+
+
+def test_slice_multi_filament_builds_argv():
+    machines = server._preset_index("machine")
+    fils = server.list_profiles("filament")["filament"]
+    procs = server._preset_index("process")
+    if not (machines and len(fils) >= 2 and procs):
+        print("  (skipped: no OrcaSlicer presets)")
+        return
+    printer = next(iter(machines))
+    proc = next(iter(procs))
+    f1, f2 = fils[0]["name"], fils[1]["name"]
+    cmd = _spy_slice_argv(model_path="test/cube.stl", printer=printer,
+                          process=proc, filaments=[f1, f2], filament_ids="1,2",
+                          plate=2, skip_objects="3,5",
+                          bed_type="Textured PEI Plate")
+    lf = cmd[cmd.index("--load-filaments") + 1]
+    assert lf.count(";") == 1, "two filaments must be joined with ;"
+    assert cmd[cmd.index("--slice") + 1] == "2"
+    assert cmd[cmd.index("--load-filament-ids") + 1] == "1,2"
+    assert cmd[cmd.index("--skip-objects") + 1] == "3,5"
+
+
+def test_slice_single_filament_backcompat():
+    machines = server._preset_index("machine")
+    fils = server.list_profiles("filament")["filament"]
+    procs = server._preset_index("process")
+    if not (machines and fils and procs):
+        print("  (skipped: no OrcaSlicer presets)")
+        return
+    cmd = _spy_slice_argv(model_path="test/cube.stl", printer=next(iter(machines)),
+                          process=next(iter(procs)), filament=fils[0]["name"],
+                          bed_type="Textured PEI Plate")
+    assert ";" not in cmd[cmd.index("--load-filaments") + 1]
+    assert cmd[cmd.index("--slice") + 1] == "0"        # all plates by default
+    assert "--skip-objects" not in cmd
+
+
+def test_slice_return_keeps_singular_filament_key():
+    # single-material callers that predate multi-filament still read `filament`
+    machines = server._preset_index("machine")
+    fils = server.list_profiles("filament")["filament"]
+    procs = server._preset_index("process")
+    if not (machines and fils and procs):
+        print("  (skipped: no OrcaSlicer presets)")
+        return
+    import subprocess
+    orig, captured = subprocess.run, {}
+
+    class _Done:
+        returncode = 0
+        stdout = stderr = ""
+
+    def spy(cmd, **kw):
+        out = cmd[cmd.index("--outputdir") + 1]
+        Path(out, "plate_1.gcode").write_text("M190 S65\nM109 S220\n")
+        return _Done()
+
+    subprocess.run = spy
+    try:
+        with tempfile.TemporaryDirectory() as out:
+            r = server.slice_model(model_path="test/cube.stl",
+                                   printer=next(iter(machines)),
+                                   process=next(iter(procs)),
+                                   filament=fils[0]["name"],
+                                   bed_type="Textured PEI Plate", output_dir=out)
+    finally:
+        subprocess.run = orig
+    pu = r["presets_used"]
+    assert pu["filament"] == fils[0]["name"]        # back-compat key present
+    assert pu["filaments"] == [fils[0]["name"]]     # and the new list
+
+
+# -------------------------------------------------- watch_print (WS1)
+
+
+class _ScriptedBackend:
+    """A fake backend that returns a scripted sequence of statuses."""
+
+    name = "fake"
+
+    def __init__(self, states):
+        self._states = list(states)
+        self._i = 0
+
+    async def status(self):
+        s = self._states[min(self._i, len(self._states) - 1)]
+        self._i += 1
+        state, layer = (s if isinstance(s, tuple) else (s, 0))
+        return {"state": state, "native_state": state,
+                "print": {"progress_pct": 0, "current_layer": layer,
+                          "total_layers": 100, "filename": "x.gcode",
+                          "error_code": None},
+                "temps_c": {"nozzle": 200.0, "bed": 60.0}}
+
+    async def close(self):
+        pass
+
+
+def _run_watch(states, **kw):
+    saved = server._backend
+
+    async def fake_backend(host=None):
+        return _ScriptedBackend(states)
+
+    server._backend = fake_backend
+    try:
+        import asyncio
+        return asyncio.run(server.watch_print(**kw))
+    finally:
+        server._backend = saved
+
+
+def test_watch_print_returns_on_state_change():
+    # heating -> heating -> printing: must return "changed" when it flips
+    r = _run_watch([("heating", 0), ("heating", 0), ("printing", 1)],
+                   until="change", timeout_s=60)
+    assert r["reason"] == "changed" and r["state"] == "printing", r
+
+
+def test_watch_print_returns_on_target_state():
+    r = _run_watch([("printing", 5), ("printing", 6), ("complete", 100)],
+                   until="complete", timeout_s=60)
+    assert r["reason"] == "reached" and r["state"] == "complete", r
+    assert r["layers_advanced"] == 95, r
+
+
+def test_watch_print_error_returns_immediately():
+    # even watching for "complete", an ERROR must short-circuit
+    r = _run_watch([("error", 3)], until="complete", timeout_s=60)
+    assert r["reason"] == "error" and r["state"] == "error", r
+
+
+def test_watch_print_times_out_bounded():
+    # steady state, never changes -> must return "timeout", not hang
+    r = _run_watch([("printing", 7)], until="complete", timeout_s=3)
+    assert r["reason"] == "timeout" and r["state"] == "printing", r
+
+
+def test_watch_print_rejects_bad_until():
+    try:
+        _run_watch([("idle", 0)], until="frobnicate")
+    except ValueError:
+        return
+    raise AssertionError("must reject an unknown 'until' state")
+
+
+# -------------------------------------------------- end-to-end (WS3)
+# real httpx client -> real socket -> fixture server. Proves the flows
+# MockTransport can't: digest auth, session lifecycle, multipart over the wire.
+
+import test_fixtures as fx
+
+
+def _e2e(handler, ttype, **target_kw):
+    with fx.fixture(handler) as port:
+        t = Target(type=ttype, host="127.0.0.1", port=port, **target_kw)
+        b = backends.make(t)
+        f = Path(tempfile.mkstemp(suffix=".gcode")[1])
+        f.write_text("G28\n")
+        try:
+            async def go():
+                s = await b.status()
+                await b.upload(f, "e2e.gcode")   # must not start a print
+                await b.close()
+                return s
+            return asyncio.run(go()), handler.calls
+        finally:
+            f.unlink()
+
+
+def test_e2e_moonraker():
+    s, calls = _e2e(fx.MoonrakerHandler, "moonraker")
+    assert s["state"] == backends.PRINTING and s["print"]["current_layer"] == 3
+    assert ("POST", "/server/files/upload") in calls
+
+
+def test_e2e_octoprint_api_key():
+    s, calls = _e2e(fx.OctoPrintHandler, "octoprint", api_key="testkey")
+    assert s["state"] == backends.PRINTING, s
+    assert ("POST", "/api/files/local") in calls
+
+
+def test_e2e_prusalink_digest_auth():
+    # the whole point: httpx must complete the 401 Digest challenge over a real
+    # socket. If digest were broken, status() would raise on the 401.
+    s, calls = _e2e(fx.PrusaLinkHandler, "prusalink", user="maker", password="pw")
+    assert s["state"] == backends.PRINTING, s
+    # a 401 challenge then a re-request means the status path was hit twice
+    assert calls.count(("GET", "/api/v1/status")) >= 2, calls
+    assert ("PUT", "/api/v1/files/usb/e2e.gcode") in calls
+
+
+def test_e2e_duet_session_lifecycle():
+    fx.DuetHandler.sessions = 0
+    s, calls = _e2e(fx.DuetHandler, "duet", password="reprap")
+    assert s["state"] == backends.PRINTING, s
+    # backend must have released the session it opened
+    assert fx.DuetHandler.sessions == 0, "Duet session was not disconnected"
+    assert ("GET", "/rr_disconnect") in calls
+    # and reused one session across the multiple rr_model reads in status()
+    assert calls.count(("GET", "/rr_connect")) == 1, calls
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in tests:
