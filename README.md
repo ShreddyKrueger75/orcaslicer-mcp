@@ -1,6 +1,6 @@
 # OrcaSlicer MCP
 
-![tests](https://github.com/ShreddyKrueger75/orcaslicer-mcp/actions/workflows/ci.yml/badge.svg)
+![tests](https://github.com/ShreddyKrueger75/claude-orcaslicer-mcp/actions/workflows/ci.yml/badge.svg)
 
 An MCP server that gives Claude (or any MCP client) the full FDM pipeline:
 **slice models headlessly with OrcaSlicer, manage presets, analyze G-code, and
@@ -89,7 +89,7 @@ Requirements: Python 3.10+, [OrcaSlicer](https://github.com/SoftFever/OrcaSlicer
 (tested with 2.4.1), and — for printer control — a supported printer on your LAN.
 
 ```bash
-git clone https://github.com/ShreddyKrueger75/orcaslicer-mcp
+git clone https://github.com/ShreddyKrueger75/claude-orcaslicer-mcp
 cd orcaslicer-mcp
 uv venv --python 3.11 && uv pip install -e .
 claude mcp add orcaslicer -- "$(pwd)/.venv/bin/python" "$(pwd)/server.py"
